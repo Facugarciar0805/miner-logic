@@ -29,7 +29,7 @@ void loop() {
   uint32_t hashEndTime = micros();
 
   /* --- INICIO DEL IF DE SEGURIDAD --- */
-  if (result.startsWith("00")) {
+  if (result.startsWith("000")) {
     uint32_t sessionEndTime = millis();
     
     // Calculamos tiempos
@@ -65,7 +65,7 @@ void loop() {
   Serial.println("========================================\n");
 
   nonce += 1;
-  delay(100); 
+  delay(10); 
 }
 
 /**
