@@ -5,27 +5,29 @@
 #include <mbedtls/md.h>
 
 // --- Configuración de Red y Broker ---
-const char* ssid = "TU_SSID";
+const char* ssid = "TU_WIFI";
 const char* password = "TU_PASSWORD";
-const char* mqtt_server = "IP_PUBLICA_DE_TU_EC2"; // La IP de tu Broker
+const char* mqtt_server = "IP_DE_TU_EC2_PUBLICA"; // Ej: 3.21.45.X
 
-// --- Variables de Control y Multitarea ---
-TaskHandle_t Miner_Task;
-QueueHandle_t miningQueue;
-String minerId;
-
+// --- Variables y Colas ---
 WiFiClient espClient;
 PubSubClient client(espClient);
+String minerId;
 
-// Estructura para pasar datos entre núcleos
 struct MiningJob {
     char blockData[64];
     int difficulty;
-    uint32_t startNonce;
 };
 
-/* =================== LÓGICA DE MINERÍA (CORE 1) ===================== */
+struct MiningSolution {
+    uint32_t nonce;
+    char hash[65];
+};
 
+QueueHandle_t miningQueue;
+QueueHandle_t solutionQueue;
+
+/* =================== NÚCLEO 1: MINERÍA ===================== */
 String runHash(String payload) {
     byte shaResult[32];
     mbedtls_md_context_t ctx;
@@ -37,6 +39,7 @@ String runHash(String payload) {
     mbedtls_md_free(&ctx);
 
     String hashHex = "";
+    hashHex.reserve(64);
     for (int i = 0; i < 32; i++) {
         char buf[3];
         sprintf(buf, "%02x", shaResult[i]);
@@ -48,66 +51,53 @@ String runHash(String payload) {
 void minerCore1(void * parameter) {
     MiningJob currentJob;
     uint32_t nonce = 0;
-    bool miningActive = false;
-    String targetPrefix = "";
+    bool isMining = false;
+    String target = "";
 
     while (true) {
-        // Revisar si hay un nuevo trabajo en la cola (sin bloquear si ya estamos minando)
-        if (xQueueReceive(miningQueue, &currentJob, miningActive ? 0 : portMAX_DELAY)) {
-            nonce = currentJob.startNonce;
-            targetPrefix = "";
-            for(int i=0; i<currentJob.difficulty; i++) targetPrefix += "0";
-            miningActive = true;
-            Serial.println(">>> Nuevo Bloque Recibido. Empezando minería...");
+        // Revisar si llegó un nuevo bloque
+        if (xQueueReceive(miningQueue, &currentJob, isMining ? 0 : portMAX_DELAY)) {
+            nonce = 0; // Reiniciamos el nonce para el nuevo bloque
+            target = "";
+            for(int i=0; i<currentJob.difficulty; i++) target += "0";
+            isMining = true;
         }
 
-        if (miningActive) {
-            // EL SECRETO: Combinamos Datos + ID_UNICO + Nonce
+        if (isMining) {
             String payload = String(currentJob.blockData) + minerId + String(nonce);
-            String result = runHash(payload);
+            String hash = runHash(payload);
 
-            if (result.startsWith(targetPrefix)) {
-                Serial.printf("!!! BLOQUE HALLADO !!! Nonce: %d\n", nonce);
+            if (hash.startsWith(target)) {
+                MiningSolution sol;
+                sol.nonce = nonce;
+                strlcpy(sol.hash, hash.c_str(), sizeof(sol.hash));
                 
-                // Formatear solución para enviar al Core 0
-                StaticJsonDocument<200> doc;
-                doc["miner"] = minerId;
-                doc["nonce"] = nonce;
-                doc["hash"] = result;
-                char buffer[200];
-                serializeJson(doc, buffer);
-                
-                // En la simulación, enviamos el éxito por un topic específico
-                client.publish("mining/solution", buffer);
-                miningActive = false; // Parar hasta recibir nuevo bloque
+                // Enviar éxito al Core 0 y detener minería hasta el próximo bloque
+                xQueueSend(solutionQueue, &sol, portMAX_DELAY);
+                isMining = false; 
             }
-
             nonce++;
-            if (nonce % 500 == 0) yield(); // Alimentar al Watchdog
+            if (nonce % 500 == 0) yield(); // Evitar reinicio por Watchdog
         }
     }
 }
 
-/* =================== COMUNICACIÓN (CORE 0) ===================== */
-
+/* =================== NÚCLEO 0: COMUNICACIÓN ===================== */
 void callback(char* topic, byte* payload, unsigned int length) {
-    StaticJsonDocument<200> doc;
+    StaticJsonDocument<256> doc;
     deserializeJson(doc, payload, length);
 
     MiningJob newJob;
-    strlcpy(newJob.blockData, doc["data"] | "default", sizeof(newJob.blockData));
+    strlcpy(newJob.blockData, doc["data"] | "bloque_default", sizeof(newJob.blockData));
     newJob.difficulty = doc["diff"] | 4;
-    newJob.startNonce = 0;
 
-    // Enviamos el trabajo al Core 1 a través de la Queue
+    // Pasar el nuevo trabajo al Core 1
     xQueueSend(miningQueue, &newJob, portMAX_DELAY);
 }
 
 void reconnect() {
     while (!client.connected()) {
-        Serial.print("Conectando a MQTT...");
         if (client.connect(minerId.c_str())) {
-            Serial.println("Conectado");
             client.subscribe("mining/work");
         } else {
             delay(5000);
@@ -118,27 +108,42 @@ void reconnect() {
 void setup() {
     Serial.begin(115200);
     
-    // Generar ID único basado en la MAC del ESP32
+    // Generar ID único
     uint64_t mac = ESP.getEfuseMac();
-    minerId = "ESP_" + String((uint32_t)(mac >> 32), HEX) + String((uint32_t)mac, HEX);
-    Serial.println("Miner ID: " + minerId);
+    minerId = "ESP_" + String((uint32_t)mac, HEX);
+    Serial.println("Iniciando Minero: " + minerId);
 
-    // Configurar WiFi
+    // Colas de comunicación entre núcleos
+    miningQueue = xQueueCreate(1, sizeof(MiningJob));
+    solutionQueue = xQueueCreate(1, sizeof(MiningSolution));
+
     WiFi.begin(ssid, password);
     while (WiFi.status() != WL_CONNECTED) delay(500);
     
     client.setServer(mqtt_server, 1883);
     client.setCallback(callback);
 
-    // Crear la cola de comunicación entre núcleos
-    miningQueue = xQueueCreate(1, sizeof(MiningJob));
-
-    // Lanzar la tarea de minería en el Core 1
-    xTaskCreatePinnedToCore(minerCore1, "MinerTask", 10000, NULL, 1, &Miner_Task, 1);
+    xTaskCreatePinnedToCore(minerCore1, "MinerTask", 10000, NULL, 1, NULL, 1);
 }
 
 void loop() {
     if (!client.connected()) reconnect();
     client.loop();
-    delay(10); // Dejar aire para el sistema de red
+
+    MiningSolution sol;
+    // Revisar si el Core 1 encontró una solución
+    if (xQueueReceive(solutionQueue, &sol, 0)) {
+        StaticJsonDocument<256> doc;
+        doc["miner"] = minerId;
+        doc["nonce"] = sol.nonce;
+        doc["hash"] = sol.hash;
+        
+        char buffer[256];
+        serializeJson(doc, buffer);
+        
+        client.publish("mining/solution", buffer);
+        Serial.println("¡Solución enviada a AWS!");
+    }
+    
+    delay(10);
 }
