@@ -5,9 +5,9 @@
 #include <mbedtls/md.h>
 
 // --- Configuración de Red y Broker ---
-const char* ssid = "TU_WIFI";
-const char* password = "TU_PASSWORD";
-const char* mqtt_server = "IP_DE_TU_EC2_PUBLICA"; // Ej: 3.21.45.X
+const char* ssid = "UA-Alumnos";
+const char* password = "41umn05WLC";
+const char* mqtt_server = "172.22.44.5";
 
 // --- Variables y Colas ---
 WiFiClient espClient;
@@ -24,11 +24,13 @@ struct MiningSolution {
     char hash[65];
 };
 
+
+//dos queues de comunicación
 QueueHandle_t miningQueue;
 QueueHandle_t solutionQueue;
 
 /* =================== NÚCLEO 1: MINERÍA ===================== */
-String runHash(String payload) {
+String calculateHash(String payload) {
     byte shaResult[32];
     mbedtls_md_context_t ctx;
     mbedtls_md_init(&ctx);
@@ -65,7 +67,7 @@ void minerCore1(void * parameter) {
 
         if (isMining) {
             String payload = String(currentJob.blockData) + minerId + String(nonce);
-            String hash = runHash(payload);
+            String hash = calculateHash(payload);
 
             if (hash.startsWith(target)) {
                 MiningSolution sol;
