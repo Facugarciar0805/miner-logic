@@ -1,0 +1,13 @@
+{
+  "name": "miner-logic-server",
+  "version": "0.1.0",
+  "description": "Minimal MQTT broker + server for miner-logic project",
+  "main": "app.js",
+  "scripts": {
+    "start": "node app.js"
+  },
+  "dependencies": {
+    "aedes": "^0.46.0",
+    "mqtt": "^4.3.7"
+  }
+}
