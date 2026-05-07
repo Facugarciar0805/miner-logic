@@ -5,16 +5,15 @@
 #include <mbedtls/md.h>
 
 // --- Configuración de Red y Broker ---
-const char* ssid = "CalvaniRomero";
-const char* password = "mis4hijos";
-const char* mqtt_server = "192.168.4.31"; // Ej: 3.21.45.X
+const char* ssid = "UA-Alumnos";
+const char* password = "41umn05WLC";
+const char* mqtt_server = "172.22.40.81"; 
 const char* topicWork = "mining/work";
 const char* topicConsensus = "mining/consensus";
 const char* topicResolved = "mining/resolved";
 const char* topicLog = "mining/log";
 
-const unsigned long helloIntervalMs = 5000;
-const unsigned long memberTtlMs = 15000;
+// Solo dejamos el máximo de miembros para los arrays de aprobación
 const int maxMembers = 8;
 
 // --- Variables y Colas ---
@@ -23,10 +22,7 @@ PubSubClient client(espClient);
 String minerId;
 volatile bool miningActive = false;
 
-String knownMiners[maxMembers];
-unsigned long knownMinersSeen[maxMembers];
 String approvedMiners[maxMembers];
-unsigned long lastHelloSent = 0;
 
 bool consensusOpen = false;
 bool approvedByMe = false;
@@ -42,6 +38,7 @@ struct MiningJob {
     uint32_t workId;
     char blockData[64];
     int difficulty;
+    int requiredApprovals; // Ahora la cantidad requerida viaja con el trabajo
 };
 
 struct MiningSolution {
@@ -100,37 +97,6 @@ bool dequeueWork(MiningJob& job) {
     return true;
 }
 
-int findMinerIndex(const String& id) {
-    for (int i = 0; i < maxMembers; i++) {
-        if (knownMiners[i] == id) return i;
-    }
-    return -1;
-}
-
-void touchMiner(const String& id) {
-    if (!id.length()) return;
-    int index = findMinerIndex(id);
-    if (index < 0) {
-        for (int i = 0; i < maxMembers; i++) {
-            if (!knownMiners[i].length()) {
-                knownMiners[i] = id;
-                index = i;
-                break;
-            }
-        }
-    }
-    if (index >= 0) knownMinersSeen[index] = millis();
-}
-
-int activeMinerCount() {
-    int count = 0;
-    unsigned long now = millis();
-    for (int i = 0; i < maxMembers; i++) {
-        if (knownMiners[i].length() && (now - knownMinersSeen[i] <= memberTtlMs)) count++;
-    }
-    return count > 0 ? count : 1;
-}
-
 void resetApprovalTrackers() {
     for (int i = 0; i < maxMembers; i++) {
         approvedMiners[i] = "";
@@ -186,18 +152,6 @@ void publishSolutionLog(uint32_t workId, uint32_t nonce, const char* hash, unsig
     if (size > 0) client.publish(topicLog, buffer, size);
 }
 
-void publishHello() {
-    StaticJsonDocument<128> doc;
-    doc["type"] = "hello";
-    doc["miner"] = minerId;
-    char buffer[128];
-    size_t size = serializeJson(doc, buffer, sizeof(buffer));
-    if (size > 0) {
-        // publish retained so new subscribers learn about miners without frequent hellos
-        client.publish(topicConsensus, (uint8_t*)buffer, size, true);
-    }
-}
-
 void publishApproval(const MiningJob& job) {
     StaticJsonDocument<256> doc;
     doc["type"] = "approval";
@@ -208,6 +162,7 @@ void publishApproval(const MiningJob& job) {
     doc["hash"] = proposalHash;
     doc["block"] = job.blockData;
     doc["diff"] = job.difficulty;
+    doc["required"] = job.requiredApprovals;
     publishConsensus(doc);
 }
 
@@ -221,7 +176,8 @@ void publishProposal(const MiningSolution& sol) {
     proposalHash = sol.hash;
     consensusOpen = true;
     resetApprovalTrackers();
-    requiredApprovals = activeMinerCount();
+    // Tomamos la cantidad requerida que vino en el trabajo original
+    requiredApprovals = sol.job.requiredApprovals;
     miningActive = false;
 
     StaticJsonDocument<256> doc;
@@ -263,7 +219,7 @@ void publishResolved(const MiningSolution& sol) {
     if (size > 0) client.publish(topicResolved, buffer, size);
 }
 
-/* =================== NÚCLEO 1: MINERÍA ===================== */
+//=================== NÚCLEO 1: MINERÍA ===================== 
 String runHash(String payload) {
     byte shaResult[32];
     mbedtls_md_context_t ctx;
@@ -302,7 +258,7 @@ void minerCore1(void * parameter) {
         }
 
         if (isMining && miningActive) {
-            String payload = String(currentJob.blockData) + String(nonce);
+            String payload = String(currentJob.blockData) + minerId + String(nonce);
             String hash = runHash(payload);
 
             if (hash.startsWith(target)) {
@@ -315,13 +271,12 @@ void minerCore1(void * parameter) {
 
                 publishSolutionLog(sol.workId, sol.nonce, sol.hash, sol.elapsedMs);
 
-                // Enviar éxito al Core 0 y detener minería hasta el próximo bloque
                 xQueueSend(solutionQueue, &sol, portMAX_DELAY);
                 miningActive = false;
                 isMining = false; 
             }
             nonce++;
-            if (nonce % 500 == 0) yield(); // Evitar reinicio por Watchdog
+            if (nonce % 500 == 0) yield(); 
         } else if (isMining && !miningActive) {
             isMining = false;
         } else {
@@ -330,27 +285,24 @@ void minerCore1(void * parameter) {
     }
 }
 
-/* =================== NÚCLEO 0: COMUNICACIÓN ===================== */
+// =================== NÚCLEO 0: COMUNICACIÓN ===================== 
 void callback(char* topic, byte* payload, unsigned int length) {
-    Serial.printf("MQTT RX topic=%s len=%u\n", topic, length);
-
     StaticJsonDocument<512> doc;
     DeserializationError err = deserializeJson(doc, payload, length);
-    if (err) {
-        Serial.printf("JSON invalido en mining/work: %s\n", err.c_str());
-        return;
-    }
+    if (err) return;
 
     if (strcmp(topic, topicWork) == 0) {
         MiningJob newJob;
         newJob.workId = doc["id"] | 0;
         strlcpy(newJob.blockData, doc["data"] | "bloque_default", sizeof(newJob.blockData));
         newJob.difficulty = doc["diff"] | 4;
+        
+        newJob.requiredApprovals = doc["required"] | 1; 
+
         consensusOpen = false;
         approvedByMe = false;
         approvalCount = 0;
-        requiredApprovals = 0;
-
+        
         publishLog("recibi un trabajo", (int)newJob.workId);
 
         enqueueWork(newJob);
@@ -361,11 +313,6 @@ void callback(char* topic, byte* payload, unsigned int length) {
 
     const char* type = doc["type"] | "";
     const char* sender = doc["miner"] | "";
-    touchMiner(sender);
-
-    if (strcmp(type, "hello") == 0) {
-        return;
-    }
 
     if (strcmp(type, "proposal") == 0) {
         if (String(sender) == minerId) return;
@@ -375,7 +322,9 @@ void callback(char* topic, byte* payload, unsigned int length) {
         proposalWorkId = doc["workId"] | 0;
         proposalNonce = doc["nonce"] | 0;
         proposalHash = doc["hash"] | "";
-        requiredApprovals = doc["required"] | activeMinerCount();
+        
+        requiredApprovals = doc["required"] | 1; 
+        
         resetApprovalTrackers();
         consensusOpen = true;
         miningActive = false;
@@ -384,8 +333,10 @@ void callback(char* topic, byte* payload, unsigned int length) {
         job.workId = doc["workId"] | 0;
         strlcpy(job.blockData, doc["block"] | "bloque_default", sizeof(job.blockData));
         job.difficulty = doc["diff"] | 4;
+        job.requiredApprovals = requiredApprovals;
 
-        String check = runHash(String(job.blockData) + String(proposalNonce));
+        String check = runHash(String(job.blockData) + proposalMiner + String(proposalNonce));
+        
         if (check == proposalHash) {
             if (registerApproval(minerId)) {
                 approvedByMe = true;
@@ -441,13 +392,12 @@ void reconnect() {
         Serial.println("Conectando a MQTT...");
         if (client.connect(minerId.c_str())) {
             Serial.println("MQTT conectado");
-            bool okWork = client.subscribe(topicWork, 0);
-            bool okConsensus = client.subscribe(topicConsensus, 0);
-            Serial.printf("Suscripcion a mining/work: %s\n", okWork ? "OK" : "FALLO");
-            Serial.printf("Suscripcion a mining/consensus: %s\n", okConsensus ? "OK" : "FALLO");
-            publishHello();
+            client.subscribe(topicWork, 0);
+            client.subscribe(topicConsensus, 0);
+            
+            // ¡NUEVO! Publicamos en el log apenas nos conectamos
+            publishLog("minero conectado a la red");
         } else {
-            Serial.printf("Fallo MQTT rc=%d. Reintento en 5s\n", client.state());
             delay(5000);
         }
     }
@@ -456,12 +406,11 @@ void reconnect() {
 void setup() {
     Serial.begin(115200);
     
-    // Generar ID único
-    uint64_t mac = ESP.getEfuseMac();
-    minerId = "ESP_" + String((uint32_t)mac, HEX);
+    String macStr = WiFi.macAddress();
+    macStr.replace(":", ""); // Le sacamos los dos puntos para que quede limpio
+    minerId = "ESP_" + macStr;
     Serial.println("Iniciando Minero: " + minerId);
 
-    // Colas de comunicación entre núcleos (allow small backlog)
     solutionQueue = xQueueCreate(1, sizeof(MiningSolution));
     workMutex = xSemaphoreCreateMutex();
 
@@ -469,13 +418,6 @@ void setup() {
     WiFi.setSleep(false);
     WiFi.begin(ssid, password);
     while (WiFi.status() != WL_CONNECTED) delay(500);
-    Serial.println("WiFi OK");
-    Serial.printf("  SSID: %s\n", ssid);
-    Serial.printf("  IP: %s\n", WiFi.localIP().toString().c_str());
-    Serial.printf("  Gateway: %s\n", WiFi.gatewayIP().toString().c_str());
-    Serial.printf("  Subnet: %s\n", WiFi.subnetMask().toString().c_str());
-    Serial.printf("  RSSI: %d dBm\n", WiFi.RSSI());
-    Serial.printf("  MQTT server: %s\n", mqtt_server);
     
     client.setServer(mqtt_server, 1883);
     client.setCallback(callback);
@@ -488,16 +430,12 @@ void loop() {
     if (!client.connected()) reconnect();
     client.loop();
 
-    // hello is published on connect as retained; periodic hellos removed to reduce traffic
-
     MiningSolution sol;
-    // Revisar si el Core 1 encontró una solución
     if (xQueueReceive(solutionQueue, &sol, 0)) {
         if (!consensusOpen) {
             publishProposal(sol);
-            Serial.println("Propuesta enviada a consensus");
         }
     }
-    
     delay(10);
 }
+
