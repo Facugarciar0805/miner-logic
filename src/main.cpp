@@ -7,7 +7,7 @@
 // --- Configuración de Red y Broker ---
 const char* ssid = "UA-Alumnos";
 const char* password = "41umn05WLC";
-const char* mqtt_server = "172.22.40.81"; 
+const char* mqtt_server = "172.22.42.124"; 
 const char* topicWork = "mining/work";
 const char* topicConsensus = "mining/consensus";
 const char* topicResolved = "mining/resolved";
