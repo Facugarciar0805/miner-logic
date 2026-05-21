@@ -3,11 +3,24 @@
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
 #include <mbedtls/md.h>
+#include <ScreenController.h>
+
+
+// -- Configuración de pantalla
+ScreenController screen;
+uint8_t spinnerPaso = 0;         // Avanza en cada ciclo del loop
+unsigned long resolvedUntil = 0; // Timestamp hasta el que mostramos el tick
+
+enum DisplayState { DISP_IDLE, DISP_MINING, DISP_CONSENSUS, DISP_RESOLVED };
+DisplayState displayState = DISP_IDLE;
+
+volatile uint32_t currentNonce = 0;
+
 
 // --- Configuración de Red y Broker ---
 const char* ssid = "UA-Alumnos";
 const char* password = "41umn05WLC";
-const char* mqtt_server = "172.22.42.124"; 
+const char* mqtt_server = "172.22.42.107"; 
 const char* topicWork = "mining/work";
 const char* topicConsensus = "mining/consensus";
 const char* topicResolved = "mining/resolved";
@@ -259,6 +272,7 @@ void minerCore1(void * parameter) {
 
         if (isMining && miningActive) {
             String payload = String(currentJob.blockData) + minerId + String(nonce);
+            currentNonce = nonce;
             String hash = runHash(payload);
 
             if (hash.startsWith(target)) {
@@ -405,6 +419,7 @@ void reconnect() {
 
 void setup() {
     Serial.begin(115200);
+    screen.inicializar();
     
     String macStr = WiFi.macAddress();
     macStr.replace(":", ""); // Le sacamos los dos puntos para que quede limpio
@@ -417,8 +432,12 @@ void setup() {
     WiFi.mode(WIFI_STA);
     WiFi.setSleep(false);
     WiFi.begin(ssid, password);
-    while (WiFi.status() != WL_CONNECTED) delay(500);
-    
+
+    uint8_t paso = 0;
+    while (WiFi.status() != WL_CONNECTED) {
+        screen.mostrarSpinner(paso++, "Conectando WiFi");
+        delay(200);
+    }
     client.setServer(mqtt_server, 1883);
     client.setCallback(callback);
     client.setBufferSize(1024);
@@ -436,6 +455,23 @@ void loop() {
             publishProposal(sol);
         }
     }
-    delay(10);
+    unsigned long now = millis();
+
+    if (displayState == DISP_RESOLVED) {
+        if (now >= resolvedUntil) displayState = DISP_IDLE;
+        // El tick ya se dibujó cuando se resolvió; no hacemos nada más aquí
+    } else if (consensusOpen) {
+        displayState = DISP_CONSENSUS;
+        screen.mostrarConsenso(spinnerPaso++, approvalCount, requiredApprovals);
+    } else if (miningActive) {
+        displayState = DISP_MINING;
+        screen.mostrarMinando(spinnerPaso++, /* workId actual */ 0, currentNonce);
+        // Nota: workId lo podés exponer igual que currentNonce si lo necesitás
+    } else {
+        displayState = DISP_IDLE;
+        screen.mostrarSpinner(spinnerPaso++, "Esperando trabajo");
+    }
+
+    delay(150);
 }
 
